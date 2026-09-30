@@ -1,8 +1,38 @@
 import { useEffect, useRef, useState, type RefObject } from 'react'
 import { Game, IS_TOUCH, PERF_LOW, LOW_GPU } from './game/Game'
 import type { BannerData, FeedEntry, HudData, OverData, RadarData, WheelState } from './game/Game'
+import { detectLang, getLang, setLang, t, type Lang } from './game/i18n'
+import {
+  initYandex, isYandex, showFullscreenAdv, saveCloud, loadCloud,
+  onPlatformPause, yandexLang, gameplayStop,
+} from './game/yandex'
 
 const WEAPON_LABELS = ['AK-47', 'UZI', 'P90', 'AWP', 'DEAGLE', 'НОЖ']
+
+/* ---------- настройки и прогресс (пункты 1.9, 2.6, 6.2) ---------- */
+export interface Settings { volume: number; sens: number; quality: 'auto' | 'high' | 'low'; lang: Lang }
+const DEF_SETTINGS: Settings = { volume: 0.8, sens: 1, quality: 'auto', lang: 'ru' }
+export interface Progress { wins: number; losses: number; kills: number; deaths: number; matches: number; bestKills: number }
+const DEF_PROGRESS: Progress = { wins: 0, losses: 0, kills: 0, deaths: 0, matches: 0, bestKills: 0 }
+const SETTINGS_KEY = 'cs3d_settings_v2'
+const PROGRESS_KEY = 'cs3d_progress_v2'
+
+function loadSettings(): Settings {
+  try {
+    const raw = localStorage.getItem(SETTINGS_KEY)
+    if (raw) return { ...DEF_SETTINGS, ...JSON.parse(raw) }
+  } catch { /* noop */ }
+  return { ...DEF_SETTINGS }
+}
+function persistSettings(s: Settings) { try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(s)) } catch { /* noop */ } }
+function loadProgress(): Progress {
+  try {
+    const raw = localStorage.getItem(PROGRESS_KEY)
+    if (raw) return { ...DEF_PROGRESS, ...JSON.parse(raw) }
+  } catch { /* noop */ }
+  return { ...DEF_PROGRESS }
+}
+function persistProgress(p: Progress) { try { localStorage.setItem(PROGRESS_KEY, JSON.stringify(p)) } catch { /* noop */ } }
 
 type Screen = 'menu' | 'play' | 'paused' | 'over'
 
@@ -53,16 +83,20 @@ function TBtn({ children, className, onDown, onUp, title }: {
 }
 
 /* ---------- мобильное управление: джойстик + обзор + кнопки ---------- */
-function TouchControls({ game, activeWeapon, onSelectWeapon, onPause }: {
+function TouchControls({ game, activeWeapon, onSelectWeapon, onPause, ts, compact }: {
   game: () => Game | null
   activeWeapon: number
   onSelectWeapon: (i: number) => void
   onPause: () => void
+  ts: number      // масштаб интерфейса под размер экрана
+  compact: boolean
 }) {
   const layerRef = useRef<HTMLDivElement>(null)
   const baseRef = useRef<HTMLDivElement>(null)
   const knobRef = useRef<HTMLDivElement>(null)
-  const R = 54
+  // радиус джойстика - адаптивный под размер экрана
+  const R = Math.round(Math.min(60, Math.max(40, window.innerWidth * 0.08)) * Math.max(ts, 0.7))
+  const KR = Math.round(R * 0.85)
   const pts = useRef<Record<number, { role: 'move' | 'look'; ox: number; oy: number; lx: number; ly: number }>>({})
 
   const hideJoy = () => {
@@ -91,11 +125,31 @@ function TouchControls({ game, activeWeapon, onSelectWeapon, onPause }: {
       let dx = e.clientX - p.ox
       let dy = e.clientY - p.oy
       const len = Math.hypot(dx, dy)
-      if (len > R) { dx = (dx / len) * R; dy = (dy / len) * R }
-      if (knobRef.current) knobRef.current.style.transform = `translate(${dx}px,${dy}px)`
+      
+      // Мёртвая зона в центре для более точного контроля
+      const deadZone = R * 0.15
+      if (len < deadZone) {
+        dx = 0
+        dy = 0
+      } else {
+        // Нормализация с учётом мёртвой зоны
+        const normalizedLen = Math.min(len, R)
+        const scale = (normalizedLen - deadZone) / (R - deadZone)
+        dx = (dx / len) * R * scale
+        dy = (dy / len) * R * scale
+      }
+      
+      if (knobRef.current) {
+        knobRef.current.style.transform = `translate(${dx}px,${dy}px)`
+        // Визуальная обратная связь - изменение прозрачности
+        const intensity = Math.min(1, len / R)
+        knobRef.current.style.opacity = String(0.7 + intensity * 0.3)
+      }
       game()?.setMoveInput(dx / R, -dy / R)
     } else {
-      game()?.addLook(e.clientX - p.lx, e.clientY - p.ly)
+      // Улучшенная чувствительность обзора
+      const lookSens = 1.2
+      game()?.addLook((e.clientX - p.lx) * lookSens, (e.clientY - p.ly) * lookSens)
       p.lx = e.clientX
       p.ly = e.clientY
     }
@@ -119,54 +173,62 @@ function TouchControls({ game, activeWeapon, onSelectWeapon, onPause }: {
         onPointerUp={onUp}
         onPointerCancel={onUp}
       />
-      {/* джойстик */}
-      <div ref={baseRef} className="pointer-events-none fixed z-30 -ml-[62px] -mt-[62px] h-[124px] w-[124px] rounded-full border-2 border-[#f2a33c]/40 bg-[#f2a33c]/5" style={{ opacity: 0 }}>
-        <div ref={knobRef} className="absolute left-1/2 top-1/2 -ml-[26px] -mt-[26px] h-[52px] w-[52px] rounded-full border-2 border-[#f2a33c]/70 bg-[#f2a33c]/25" />
+      {/* джойстик (размер зависит от экрана) */}
+      <div
+        ref={baseRef}
+        className="pointer-events-none fixed z-30 rounded-full border-2 border-[#f2a33c]/40 bg-[#f2a33c]/5"
+        style={{ opacity: 0, width: R * 2 + 16, height: R * 2 + 16, marginLeft: -(R + 8), marginTop: -(R + 8) }}
+      >
+        <div
+          ref={knobRef}
+          className="absolute left-1/2 top-1/2 rounded-full border-2 border-[#f2a33c]/70 bg-[#f2a33c]/25"
+          style={{ width: KR, height: KR, marginLeft: -KR / 2, marginTop: -KR / 2 }}
+        />
       </div>
 
-      {/* оружие (слоты сверху) */}
-      <div className="pointer-events-auto absolute left-1/2 top-16 z-40 flex -translate-x-1/2 gap-1">
+      {/* оружие (слоты сверху; на узких экранах — только цифры) */}
+      <div className={`pointer-events-auto absolute left-1/2 z-40 flex -translate-x-1/2 gap-1 ${compact ? 'top-14' : 'top-16'}`}>
         {WEAPON_LABELS.map((w, i) => (
           <TBtn
             key={w}
             title={w}
             onDown={() => onSelectWeapon(i)}
-            className={`h-9 rounded-md px-2.5 text-[11px] tracking-wider ${
+            className={`rounded-md text-[calc(11px*var(--ts,1))] tracking-wider ${compact ? 'h-[calc(2rem*var(--ts,1))] w-[calc(2rem*var(--ts,1))] px-0' : 'h-[calc(2.25rem*var(--ts,1))] px-[calc(0.6rem*var(--ts,1))]'} ${
               activeWeapon === i
                 ? 'border-[#f2a33c] bg-[#3a2a12]/90 text-[#f2a33c]'
                 : 'border-[#2b3844] bg-[#12181f]/80 text-[#8b98a7]'
             }`}
           >
-            <span className="skew-x-0">{i + 1}·{w}</span>
+            <span className="skew-x-0">{i + 1}{!compact && `·${w}`}</span>
           </TBtn>
         ))}
       </div>
 
       {/* пауза (справа сверху) */}
-      <TBtn title="Пауза" onDown={onPause} className="absolute right-3 top-3 z-40 h-10 w-10 border-[#2b3844] bg-[#12181f]/85 text-[#c8d2dd]">
-        <svg viewBox="0 0 16 16" className="h-4 w-4 fill-current"><path d="M4 2h3v12H4zM9 2h3v12H9z" /></svg>
+      <TBtn title="Пауза" onDown={onPause} className="absolute right-2 top-2 z-40 h-[calc(2.4rem*var(--ts,1))] w-[calc(2.4rem*var(--ts,1))] border-[#2b3844] bg-[#12181f]/85 text-[#c8d2dd]">
+        <svg viewBox="0 0 16 16" className="fill-current" style={{ width: 'calc(0.95rem*var(--ts,1))', height: 'calc(0.95rem*var(--ts,1))' }}><path d="M4 2h3v12H4zM9 2h3v12H9z" /></svg>
       </TBtn>
 
-      {/* правый кластер действий */}
-      <div className="absolute bottom-5 right-4 z-40 flex flex-col items-end gap-3">
-        <div className="flex gap-3">
-          <TBtn title="Прицел" onDown={() => g()?.doScope()} className="h-12 w-12 border-[#2b3844] bg-[#12181f]/85 text-[10px] text-[#c8d2dd]">ОПТ</TBtn>
-          <TBtn title="Перезарядка" onDown={() => g()?.doReload()} className="h-12 w-12 border-[#2b3844] bg-[#12181f]/85 text-[10px] text-[#c8d2dd]">R</TBtn>
-          <TBtn title="Граната" onDown={() => g()?.doGrenade()} className="h-12 w-12 border-[#2b3844] bg-[#12181f]/85 text-[#c9d68a]">
+      {/* правый кластер действий — всё масштабируется под экран */}
+      <div className={`absolute right-2 z-40 flex flex-col items-end gap-[calc(0.6rem*var(--ts,1))] ${compact ? 'bottom-3' : 'bottom-5'}`}>
+        <div className="flex gap-[calc(0.55rem*var(--ts,1))]">
+          <TBtn title="Прицел" onDown={() => g()?.doScope()} className="h-[calc(2.6rem*var(--ts,1))] w-[calc(2.6rem*var(--ts,1))] border-[#2b3844] bg-[#12181f]/85 text-[calc(10px*var(--ts,1))] text-[#c8d2dd]">ОПТ</TBtn>
+          <TBtn title="Перезарядка" onDown={() => g()?.doReload()} className="h-[calc(2.6rem*var(--ts,1))] w-[calc(2.6rem*var(--ts,1))] border-[#2b3844] bg-[#12181f]/85 text-[calc(10px*var(--ts,1))] text-[#c8d2dd]">R</TBtn>
+          <TBtn title="Граната" onDown={() => g()?.doGrenade()} className="h-[calc(2.6rem*var(--ts,1))] w-[calc(2.6rem*var(--ts,1))] border-[#2b3844] bg-[#12181f]/85 text-[#c9d68a]">
             <NadeIcon />
           </TBtn>
         </div>
-        <div className="flex items-end gap-4">
-          <TBtn title="Прыжок" onDown={() => g()?.doJump()} className="h-14 w-14 border-[#2b3844] bg-[#12181f]/85 text-[#c8d2dd]">
-            <svg viewBox="0 0 16 16" className="h-5 w-5 fill-current"><path d="M8 2 2 9h4v5h4V9h4z" /></svg>
+        <div className="flex items-end gap-[calc(0.7rem*var(--ts,1))]">
+          <TBtn title="Прыжок" onDown={() => g()?.doJump()} className="h-[calc(3.2rem*var(--ts,1))] w-[calc(3.2rem*var(--ts,1))] border-[#2b3844] bg-[#12181f]/85 text-[#c8d2dd]">
+            <svg viewBox="0 0 16 16" className="fill-current" style={{ width: 'calc(1.15rem*var(--ts,1))', height: 'calc(1.15rem*var(--ts,1))' }}><path d="M8 2 2 9h4v5h4V9h4z" /></svg>
           </TBtn>
           <TBtn
             title="Огонь"
             onDown={() => g()?.setFiring(true)}
             onUp={() => g()?.setFiring(false)}
-            className="h-20 w-20 border-2 border-[#e0453a] bg-[#e0453a]/25 text-[#ff8a80]"
+            className="h-[calc(4.6rem*var(--ts,1))] w-[calc(4.6rem*var(--ts,1))] border-2 border-[#e0453a] bg-[#e0453a]/25 text-[#ff8a80]"
           >
-            <svg viewBox="0 0 16 16" className="h-8 w-8 fill-current"><circle cx="8" cy="8" r="3" /><path d="M8 1v3M8 12v3M1 8h3M12 8h3" stroke="currentColor" strokeWidth="1.6" /></svg>
+            <svg viewBox="0 0 16 16" className="fill-current" style={{ width: 'calc(1.8rem*var(--ts,1))', height: 'calc(1.8rem*var(--ts,1))' }}><circle cx="8" cy="8" r="3" /><path d="M8 1v3M8 12v3M1 8h3M12 8h3" stroke="currentColor" strokeWidth="1.6" /></svg>
           </TBtn>
         </div>
       </div>
@@ -192,6 +254,22 @@ export default function App() {
   const [melee, setMelee] = useState(false)
   const [isMobile] = useState(() => IS_TOUCH)
   const [activeWeapon, setActiveWeapon] = useState(2)
+
+  // масштаб сенсорного UI: на узких экранах (Redmi A3 и т.п.) кнопки меньше
+  const [ts, setTs] = useState(() => Math.max(0.55, Math.min(1, Math.min(window.innerWidth, window.innerHeight) / 800)))
+  useEffect(() => {
+    const recalc = () => setTs(Math.max(0.55, Math.min(1, Math.min(window.innerWidth, window.innerHeight) / 800)))
+    window.addEventListener('resize', recalc)
+    window.addEventListener('orientationchange', recalc)
+    return () => { window.removeEventListener('resize', recalc); window.removeEventListener('orientationchange', recalc) }
+  }, [])
+  const compactUI = window.innerWidth < 560 || (isMobile && window.innerWidth < 860)
+  const [settings, setSettings] = useState<Settings>(() => loadSettings())
+  const [progress, setProgress] = useState<Progress>(() => loadProgress())
+  const [settingsOpen, setSettingsOpen] = useState(false)
+  const [howtoOpen, setHowtoOpen] = useState(false)
+  const [lang, setLangState] = useState<Lang>(() => getLang())
+  const [portrait, setPortrait] = useState(false)
 
   // imperative HUD refs
   const hpRef = useRef<HTMLSpanElement>(null)
@@ -298,7 +376,7 @@ export default function App() {
       const ss = String(h.timer % 60).padStart(2, '0')
       setTxt(timerRef.current, `${mm}:${ss}`)
       if (timerRef.current) timerRef.current.classList.toggle('blink-fast', h.timer <= 10)
-      setTxt(enemiesRef.current, `ОСТАЛОСЬ: ${h.enemies}`)
+      setTxt(enemiesRef.current, `${t('enemies')}: ${h.enemies}`)
       if (xhRef.current) xhRef.current.style.setProperty('--g', `${h.spreadPx}px`)
       if (reloadRef.current) reloadRef.current.style.display = h.reloading ? 'block' : 'none'
       const isLow = h.hp > 0 && h.hp < 35
@@ -371,25 +449,113 @@ export default function App() {
       },
     })
     gameRef.current = game
+    // применяем сохранённые настройки при старте
+    const s0 = loadSettings()
+    game.setSettings({ volume: s0.volume, sens: s0.sens, quality: s0.quality })
     return () => {
       game.dispose()
       gameRef.current = null
     }
   }, [])
 
+  /* ---------- Yandex SDK, язык, прогресс, ориентация, платформенная пауза ---------- */
+  useEffect(() => {
+    let offPause: (() => void) | null = null
+    initYandex().then(() => {
+      // автоопределение языка (пункт 2.14): SDK -> браузер
+      const detected = isYandex() ? yandexLang() : detectLang()
+      const saved = loadSettings()
+      const useLang = saved.lang || detected
+      setLang(useLang)
+      setLangState(useLang)
+      // облачный прогресс (пункт 1.9)
+      loadCloud<Progress>().then((p) => { if (p) setProgress({ ...DEF_PROGRESS, ...p }) })
+      offPause = onPlatformPause(() => {
+        const g = gameRef.current
+        if (g && g.state === 'playing') { g.pause(); setScreen('paused') }
+      })
+    })
+    const onOrient = () => setPortrait(IS_TOUCH && window.innerHeight > window.innerWidth)
+    onOrient()
+    window.addEventListener('orientationchange', onOrient)
+    window.addEventListener('resize', onOrient)
+    return () => {
+      window.removeEventListener('orientationchange', onOrient)
+      window.removeEventListener('resize', onOrient)
+      offPause?.()
+    }
+  }, [])
+
+  /* ---------- сохранение настроек + применение к игре ---------- */
+  const updateSettings = (patch: Partial<Settings>) => {
+    const next = { ...settings, ...patch }
+    setSettings(next)
+    persistSettings(next)
+    if (patch.lang) { setLang(patch.lang); setLangState(patch.lang) }
+    gameRef.current?.setSettings({ volume: next.volume, sens: next.sens, quality: next.quality })
+  }
+
+  /* ---------- сохранение прогресса после матча (пункты 1.9, 2.6) ---------- */
+  const saveMatchProgress = (o: OverData) => {
+    const next: Progress = {
+      wins: progress.wins + (o.result === 'victory' ? 1 : 0),
+      losses: progress.losses + (o.result === 'defeat' ? 1 : 0),
+      kills: progress.kills + o.kills,
+      deaths: progress.deaths + o.deaths,
+      matches: progress.matches + 1,
+      bestKills: Math.max(progress.bestKills, o.kills),
+    }
+    setProgress(next)
+    persistProgress(next)
+    saveCloud(next)
+  }
+
   const startGame = () => {
     setFeed([])
     setOver(null)
+    setAdBonus(false)
     setHint(true)
     window.setTimeout(() => setHint(false), 9000)
     setScreen('play')
+    // пункт 1.6.1.1: полноэкранный режим на мобильных
+    if (IS_TOUCH) {
+      try {
+        const el = document.documentElement
+        if (el.requestFullscreen && !document.fullscreenElement) el.requestFullscreen().catch(() => {})
+      } catch { /* noop */ }
+    }
     gameRef.current?.startMatch()
+  }
+
+  // сохранение прогресса один раз за матч
+  const savedFor = useRef<OverData | null>(null)
+  useEffect(() => {
+    if (over && savedFor.current !== over) {
+      savedFor.current = over
+      saveMatchProgress(over)
+    }
+  }, [over]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // rewarded video: бонус к следующему матчу (пункт 4.5)
+  const [adBonus, setAdBonus] = useState(false)
+  const watchAdForBonus = () => {
+    if (!isYandex()) return
+    gameplayStop()
+    gameRef.current?.setAudioPaused(true)
+    showFullscreenAdv(() => {
+      gameRef.current?.setAudioPaused(false)
+      gameRef.current?.addGrenadeBonus(2)
+      setAdBonus(true)
+    })
   }
 
   /* ============================== render ============================== */
 
   return (
-    <div className="font-body relative h-full w-full touch-none select-none overflow-hidden overscroll-none bg-[#0d1218] text-[#eae6dc]">
+    <div
+      className="font-body relative h-full w-full touch-none select-none overflow-hidden overscroll-none bg-[#0d1218] text-[#eae6dc]"
+      style={{ '--ts': String(ts) } as React.CSSProperties}
+    >
       <div ref={mountRef} className="absolute inset-0 touch-none" />
 
       {/* ============ HUD ============ */}
@@ -452,7 +618,7 @@ export default function App() {
           {/* radar + kills */}
           <div className="absolute left-4 top-4">
             <div className="relative">
-              <canvas ref={radarRef} width={150} height={150} className="h-[150px] w-[150px]" />
+              <canvas ref={radarRef} width={150} height={150} className="h-[150px] w-[150px] max-[560px]:h-[96px] max-[560px]:w-[96px]" />
               <div className="radar-sweep absolute inset-0 rounded-full border border-[#f2a33c]/30" />
             </div>
             <div className="mt-1.5 border border-[#2b3844] bg-[#12181f]/90 px-3 py-1 text-[11px] font-bold tracking-widest text-[#8b98a7]">
@@ -536,7 +702,7 @@ export default function App() {
           </div>
 
           {/* bottom left: health / armor */}
-          <div className="absolute bottom-4 left-3 w-40 md:bottom-5 md:left-5 md:w-[240px]">
+          <div className={`absolute left-2 w-36 md:left-5 md:w-[240px] ${isMobile ? 'bottom-[calc(9.5rem*var(--ts,1))]' : 'bottom-5'}`}>
             <div className="flex items-end gap-3 border border-[#2b3844] bg-[#12181f]/90 px-4 py-2.5">
               <svg viewBox="0 0 24 24" className="mb-1 h-6 w-6 fill-[#e0453a]"><path d="M9 3h6v6h6v6h-6v6H9v-6H3V9h6z" /></svg>
               <div className="flex-1">
@@ -561,21 +727,21 @@ export default function App() {
           </div>
 
           {/* bottom right: ammo / grenades */}
-          <div className="absolute bottom-5 right-5 text-right">
-            <div className="border border-[#2b3844] bg-[#12181f]/90 px-5 py-2.5">
+          <div className={`absolute right-2 text-right md:right-5 ${isMobile ? 'bottom-[calc(9.5rem*var(--ts,1))]' : 'bottom-5'}`}>
+            <div className="border border-[#2b3844] bg-[#12181f]/90 px-3 py-1.5 md:px-5 md:py-2.5">
               <div className="flex items-baseline justify-end gap-2">
                 {melee && <span className="font-display text-sm tracking-widest text-[#f2a33c]">БЛИЖНИЙ БОЙ</span>}
-                <span ref={magRef} className={`font-display text-5xl leading-none ${melee ? 'hidden' : ''}`}>30</span>
-                <span ref={resRef} className={`font-display text-lg leading-none text-[#8b98a7] ${melee ? 'hidden' : ''}`}>/ 90</span>
+                <span ref={magRef} className={`font-display text-3xl leading-none md:text-5xl ${melee ? 'hidden' : ''}`}>30</span>
+                <span ref={resRef} className={`font-display text-base leading-none text-[#8b98a7] md:text-lg ${melee ? 'hidden' : ''}`}>/ 90</span>
               </div>
-              <div className="mt-1 text-[10px] font-bold tracking-[0.3em] text-[#8b98a7]">
+              <div className="mt-1 text-[9px] font-bold tracking-[0.25em] text-[#8b98a7] md:text-[10px]">
                 <span ref={weaponRef}>3·DEAGLE</span>
-                <span className="ml-2 text-[#5f6d7d]">TAB — АРСЕНАЛ</span>
+                {!isMobile && <span className="ml-2 text-[#5f6d7d]">TAB — АРСЕНАЛ</span>}
               </div>
             </div>
             <div className="mt-1.5 flex items-center justify-end gap-1.5 border border-[#2b3844] bg-[#12181f]/90 px-4 py-1.5 text-[#c9d68a]">
               <span className="mr-1 text-[10px] font-bold tracking-widest text-[#8b98a7]">ГРАНАТЫ</span>
-              {[0, 1, 2].map((i) => <NadeIcon key={i} dim={i >= nades} />)}
+              {Array.from({ length: Math.max(3, nades) }).map((_, i) => <NadeIcon key={i} dim={i >= nades} />)}
             </div>
           </div>
 
@@ -613,46 +779,86 @@ export default function App() {
           activeWeapon={activeWeapon}
           onSelectWeapon={(i) => gameRef.current?.switchWeaponByIndex(i)}
           onPause={() => gameRef.current?.pause()}
+          ts={ts}
+          compact={compactUI}
         />
       )}
 
       {/* ============ MENU ============ */}
       {screen === 'menu' && (
         <div className="absolute inset-0 z-40">
-          <div className="menu-scan absolute inset-0" style={{ background: 'linear-gradient(100deg, rgba(10,14,19,.96) 0%, rgba(10,14,19,.92) 44%, rgba(10,14,19,.55) 72%, rgba(10,14,19,.25) 100%)' }} />
+          {/* Фон с градиентом */}
+          <div className="absolute inset-0" style={{ 
+            background: 'linear-gradient(135deg, rgba(10,14,19,.98) 0%, rgba(15,20,28,.95) 50%, rgba(10,14,19,.92) 100%)'
+          }} />
           <div className="smoke absolute inset-0" />
-          <div className="hazard hazard-anim absolute top-0 left-0 h-2 w-full opacity-80" />
-          <div className="hazard hazard-anim absolute bottom-0 left-0 h-2 w-full opacity-80" />
+          
+          {/* Декоративные линии */}
+          <div className="absolute top-0 left-0 right-0 h-1 bg-gradient-to-r from-transparent via-[#f2a33c] to-transparent opacity-60" />
+          <div className="absolute bottom-0 left-0 right-0 h-1 bg-gradient-to-r from-transparent via-[#f2a33c] to-transparent opacity-60" />
 
-          <div className="relative flex h-full flex-col justify-start gap-8 overflow-y-auto px-6 py-10 md:flex-row md:items-center md:justify-between md:overflow-visible md:px-16 md:py-0 lg:px-24">
-            {/* left: title */}
+          <div className="relative flex h-full flex-col justify-start gap-6 overflow-y-auto px-4 py-8 md:flex-row md:items-center md:justify-between md:overflow-visible md:px-12 lg:px-20">
+            {/* Левая часть: заголовок */}
             <div className="max-w-xl">
-              <div className="mb-4 flex items-center gap-3">
-                <span className="inline-block h-[3px] w-10 bg-[#f2a33c]" />
-                <span className="text-[11px] font-bold tracking-[0.4em] text-[#8b98a7]">БРАУЗЕРНЫЙ ШУТЕР · THREE.JS</span>
+              <div className="mb-3 flex items-center gap-3">
+                <div className="h-[2px] w-12 bg-gradient-to-r from-[#f2a33c] to-transparent" />
+                <span className="text-[10px] font-bold tracking-[0.5em] text-[#8b98a7] uppercase">Browser FPS</span>
               </div>
-              <div className="mb-3 inline-flex items-center gap-2 border border-[#2b3844] bg-[#12181f]/80 px-2.5 py-1 text-[10px] font-bold tracking-[0.2em]">
-                <span className={`inline-block h-1.5 w-1.5 rounded-full ${PERF_LOW ? 'bg-[#f2a33c]' : 'bg-[#7fd08a]'}`} />
+              
+              {/* Индикатор графики */}
+              <div className="mb-4 inline-flex items-center gap-2 rounded-sm border border-[#2b3844] bg-[#12181f]/90 px-3 py-1.5 text-[10px] font-bold tracking-[0.2em] backdrop-blur-sm">
+                <span className={`inline-block h-2 w-2 rounded-full ${PERF_LOW ? 'bg-[#f2a33c] animate-pulse' : 'bg-[#7fd08a]'}`} />
                 <span className={PERF_LOW ? 'text-[#f2a33c]' : 'text-[#7fd08a]'}>
-                  {PERF_LOW ? (LOW_GPU ? 'ЭКОНОМ-ГРАФИКА (слабый GPU)' : 'ЭКОНОМ-ГРАФИКА (сенсор)') : 'ПОЛНАЯ ГРАФИКА'}
+                  {PERF_LOW ? (LOW_GPU ? 'OPTIMIZED MODE' : 'MOBILE MODE') : 'FULL QUALITY'}
                 </span>
-                <span className="text-[#5f6d7d]">· авто-детект + адаптация под FPS</span>
               </div>
-              <h1 className="title-glow font-display text-[64px] leading-[0.9] md:text-[120px]">
-                CS<span className="text-[#f2a33c]">&nbsp;3D</span>
+              
+              <h1 className="title-glow font-display text-[56px] leading-[0.85] tracking-tight md:text-[110px] lg:text-[130px]">
+                <span className="text-[#eae6dc]">CS</span>
+                <span className="text-[#f2a33c]">&nbsp;3D</span>
               </h1>
-              <p className="mt-5 max-w-md text-[15px] leading-relaxed text-[#aab6c4]">
-                Зачистите точку. AK-47, гранаты и живые боты, которые стрейфят и дают очередь в ответ.
+              
+              <p className="mt-4 max-w-md text-[14px] leading-relaxed text-[#aab6c4] md:text-[15px]">
+                Зачистите точку на карте <span className="font-bold text-[#f2a33c]">Dust II</span>. Шесть стволов, гранаты и живые боты.
                 Возьмите <span className="font-bold text-[#eae6dc]">3 раунда</span> быстрее, чем вас застрелят.
               </p>
               <button
                 onClick={startGame}
                 className="btn-blade mt-8 inline-block bg-[#f2a33c] px-12 py-4 text-xl text-[#14100a] hover:bg-[#ffc069]"
               >
-                <span className="inline-block skew-x-[8deg]">В БОЙ</span>
+                <span className="inline-block skew-x-[8deg]">{t('play')}</span>
               </button>
+              <div className="mt-3 flex gap-2.5">
+                <button
+                  onClick={() => setSettingsOpen(true)}
+                  className="btn-blade border border-[#3a4a5c] bg-[#182029] px-5 py-2.5 text-sm text-[#c8d2dd] hover:border-[#f2a33c]"
+                >
+                  <span className="inline-block skew-x-[8deg]">{t('settings')}</span>
+                </button>
+                <button
+                  onClick={() => setHowtoOpen(true)}
+                  className="btn-blade border border-[#3a4a5c] bg-[#182029] px-5 py-2.5 text-sm text-[#c8d2dd] hover:border-[#f2a33c]"
+                >
+                  <span className="inline-block skew-x-[8deg]">{t('howto')}</span>
+                </button>
+              </div>
               <div className="mt-4 text-[11px] font-semibold tracking-[0.25em] text-[#5f6d7d]">
                 {isMobile ? 'СЕНСОРНОЕ УПРАВЛЕНИЕ · ДЖОЙСТИК + ЗОНА ОБЗОРА' : 'КЛИК — ЗАХВАТ МЫШИ · ESC — ПАУЗА'}
+              </div>
+
+              {/* рекорды (сохраняются, пункт 1.9) */}
+              <div className="mt-5 grid max-w-md grid-cols-4 gap-2">
+                {[
+                  { v: progress.wins, l: 'ПОБЕД' },
+                  { v: progress.bestKills, l: 'РЕКОРД ФРАГОВ' },
+                  { v: progress.kills, l: 'ВСЕГО ФРАГОВ' },
+                  { v: progress.matches, l: 'МАТЧЕЙ' },
+                ].map((s) => (
+                  <div key={s.l} className="border border-[#2b3844] bg-[#12181f]/85 px-2 py-2 text-center">
+                    <div className="font-display text-xl text-[#f2a33c]">{s.v}</div>
+                    <div className="mt-0.5 text-[8px] font-bold tracking-[0.15em] text-[#8b98a7]">{s.l}</div>
+                  </div>
+                ))}
               </div>
             </div>
 
@@ -711,14 +917,17 @@ export default function App() {
           <div className="w-[380px] border border-[#2b3844] bg-[#12181f]">
             <div className="hazard h-1.5 w-full opacity-70" />
             <div className="px-8 py-7">
-              <div className="font-display text-4xl tracking-wider">ПАУЗА</div>
-              <div className="mt-1 text-[11px] font-semibold tracking-[0.3em] text-[#8b98a7]">ОПЕРАЦИЯ ПРИОСТАНОВЛЕНА</div>
+              <div className="font-display text-4xl tracking-wider">{t('paused')}</div>
+              <div className="mt-1 text-[11px] font-semibold tracking-[0.3em] text-[#8b98a7]">{t('pausedSub')}</div>
               <div className="mt-6 flex flex-col gap-2.5">
                 <button onClick={() => { gameRef.current?.resume(); setScreen('play') }} className="btn-blade bg-[#f2a33c] px-6 py-3 text-base text-[#14100a] hover:bg-[#ffc069]">
-                  <span className="inline-block skew-x-[8deg]">ПРОДОЛЖИТЬ</span>
+                  <span className="inline-block skew-x-[8deg]">{t('resume')}</span>
+                </button>
+                <button onClick={() => { setSettingsOpen(true) }} className="btn-blade border border-[#3a4a5c] bg-[#182029] px-6 py-3 text-base text-[#c8d2dd] hover:border-[#f2a33c]">
+                  <span className="inline-block skew-x-[8deg]">{t('settings')}</span>
                 </button>
                 <button onClick={() => { gameRef.current?.toMenu(); setScreen('menu') }} className="btn-blade border border-[#3a4a5c] bg-[#182029] px-6 py-3 text-base text-[#c8d2dd] hover:border-[#f2a33c]">
-                  <span className="inline-block skew-x-[8deg]">В МЕНЮ</span>
+                  <span className="inline-block skew-x-[8deg]">{t('toMenu')}</span>
                 </button>
               </div>
               <div className="mt-6 border-t border-[#2b3844] pt-4 text-[11px] leading-relaxed text-[#5f6d7d]">
@@ -731,16 +940,16 @@ export default function App() {
 
       {/* ============ GAME OVER ============ */}
       {screen === 'over' && over && (
-        <div className="absolute inset-0 z-40 flex items-center justify-center bg-[#0a0e13]/80">
-          <div className="w-[440px] border border-[#2b3844] bg-[#12181f]">
+        <div className="absolute inset-0 z-40 flex items-center justify-center bg-[#0a0e13]/80 p-4">
+          <div className="w-full max-w-[440px] border border-[#2b3844] bg-[#12181f]">
             <div className="hazard h-1.5 w-full opacity-70" />
-            <div className="px-10 py-8 text-center">
-              <div className="text-[11px] font-bold tracking-[0.4em] text-[#8b98a7]">МАТЧ ЗАВЕРШЁН</div>
+            <div className="max-h-[75vh] overflow-y-auto px-6 py-6 text-center md:px-10 md:py-8">
+              <div className="text-[11px] font-bold tracking-[0.4em] text-[#8b98a7]">{t('matchOver')}</div>
               <div
                 className="title-glow font-display mt-2 text-6xl"
                 style={{ color: over.result === 'victory' ? '#f2a33c' : '#e0453a' }}
               >
-                {over.result === 'victory' ? 'ПОБЕДА' : 'ПОРАЖЕНИЕ'}
+                {over.result === 'victory' ? t('victory') : t('defeat')}
               </div>
               <div className="font-display mt-3 text-3xl text-[#eae6dc]">
                 <span className="text-[#6fb7e8]">{over.won}</span>
@@ -750,16 +959,16 @@ export default function App() {
               <div className="mt-6 grid grid-cols-2 gap-2.5">
                 <div className="border border-[#2b3844] bg-[#182029] px-4 py-3">
                   <div className="font-display text-3xl text-[#f2a33c]">{over.kills}</div>
-                  <div className="mt-0.5 text-[10px] font-bold tracking-[0.25em] text-[#8b98a7]">УСТРАНЕНО</div>
+                  <div className="mt-0.5 text-[10px] font-bold tracking-[0.25em] text-[#8b98a7]">{t('eliminated')}</div>
                 </div>
                 <div className="border border-[#2b3844] bg-[#182029] px-4 py-3">
                   <div className="font-display text-3xl text-[#e0453a]">{over.deaths}</div>
-                  <div className="mt-0.5 text-[10px] font-bold tracking-[0.25em] text-[#8b98a7]">СМЕРТЕЙ</div>
+                  <div className="mt-0.5 text-[10px] font-bold tracking-[0.25em] text-[#8b98a7]">{t('deaths')}</div>
                 </div>
               </div>
               <div className="mt-7 flex flex-col gap-2.5">
                 <button onClick={startGame} className="btn-blade bg-[#f2a33c] px-6 py-3 text-base text-[#14100a] hover:bg-[#ffc069]">
-                  <span className="inline-block skew-x-[8deg]">ЕЩЁ РАЗ</span>
+                  <span className="inline-block skew-x-[8deg]">{t('restart')}</span>
                 </button>
                 <button onClick={() => { gameRef.current?.toMenu(); setScreen('menu') }} className="btn-blade border border-[#3a4a5c] bg-[#182029] px-6 py-3 text-base text-[#c8d2dd] hover:border-[#f2a33c]">
                   <span className="inline-block skew-x-[8deg]">В МЕНЮ</span>
@@ -767,6 +976,123 @@ export default function App() {
               </div>
             </div>
           </div>
+        </div>
+      )}
+
+      {/* ============ НАСТРОЙКИ ============ */}
+      {settingsOpen && (
+        <div className="absolute inset-0 z-50 flex items-center justify-center bg-[#0a0e13]/85 p-4">
+          <div className="w-full max-w-md border border-[#2b3844] bg-[#12181f]">
+            <div className="hazard h-1.5 w-full opacity-70" />
+            <div className="px-7 py-6">
+              <div className="flex items-center justify-between">
+                <div className="font-display text-3xl tracking-wider">НАСТРОЙКИ</div>
+                <button onClick={() => setSettingsOpen(false)} className="border border-[#3a4a5c] bg-[#182029] px-3 py-1.5 text-xs font-bold tracking-widest text-[#c8d2dd] hover:border-[#f2a33c]">✕</button>
+              </div>
+
+              {/* громкость */}
+              <div className="mt-5">
+                <div className="mb-1.5 flex justify-between text-[11px] font-bold tracking-[0.2em] text-[#8b98a7]">
+                  <span>ГРОМКОСТЬ</span><span className="text-[#f2a33c]">{Math.round(settings.volume * 100)}%</span>
+                </div>
+                <input type="range" min={0} max={100} value={Math.round(settings.volume * 100)}
+                  onChange={(e) => updateSettings({ volume: Number(e.target.value) / 100 })}
+                  className="w-full accent-[#f2a33c]" />
+              </div>
+
+              {/* чувствительность */}
+              <div className="mt-4">
+                <div className="mb-1.5 flex justify-between text-[11px] font-bold tracking-[0.2em] text-[#8b98a7]">
+                  <span>ЧУВСТВИТЕЛЬНОСТЬ МЫШИ</span><span className="text-[#f2a33c]">{settings.sens.toFixed(1)}×</span>
+                </div>
+                <input type="range" min={30} max={250} value={Math.round(settings.sens * 100)}
+                  onChange={(e) => updateSettings({ sens: Number(e.target.value) / 100 })}
+                  className="w-full accent-[#f2a33c]" />
+              </div>
+
+              {/* качество */}
+              <div className="mt-4">
+                <div className="mb-1.5 text-[11px] font-bold tracking-[0.2em] text-[#8b98a7]">КАЧЕСТВО ГРАФИКИ</div>
+                <div className="flex gap-2">
+                  {(['auto', 'high', 'low'] as const).map((q) => (
+                    <button key={q} onClick={() => updateSettings({ quality: q })}
+                      className={`flex-1 border px-3 py-2 text-xs font-bold tracking-widest ${settings.quality === q ? 'border-[#f2a33c] bg-[#3a2a12]/80 text-[#f2a33c]' : 'border-[#3a4a5c] bg-[#182029] text-[#8b98a7] hover:border-[#f2a33c]'}`}>
+                      {q === 'auto' ? 'АВТО' : q === 'high' ? 'ВЫСОКОЕ' : 'НИЗКОЕ'}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* язык */}
+              <div className="mt-4">
+                <div className="mb-1.5 text-[11px] font-bold tracking-[0.2em] text-[#8b98a7]">ЯЗЫК</div>
+                <div className="flex gap-2">
+                  {(['ru', 'en'] as const).map((l) => (
+                    <button key={l} onClick={() => updateSettings({ lang: l })}
+                      className={`flex-1 border px-3 py-2 text-sm font-bold tracking-widest ${settings.lang === l ? 'border-[#f2a33c] bg-[#3a2a12]/80 text-[#f2a33c]' : 'border-[#3a4a5c] bg-[#182029] text-[#8b98a7] hover:border-[#f2a33c]'}`}>
+                      {l === 'ru' ? 'РУССКИЙ' : 'ENGLISH'}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* сброс прогресса */}
+              <button
+                onClick={() => { const empty = { ...DEF_PROGRESS }; setProgress(empty); persistProgress(empty); saveCloud(empty) }}
+                className="mt-5 w-full border border-[#5c2a24] bg-[#221409] px-4 py-2 text-xs font-bold tracking-[0.2em] text-[#e0453a] hover:border-[#e0453a]">
+                СБРОСИТЬ ПРОГРЕСС
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ============ УПРАВЛЕНИЕ (how-to) ============ */}
+      {howtoOpen && (
+        <div className="absolute inset-0 z-50 flex items-center justify-center bg-[#0a0e13]/85 p-4">
+          <div className="w-full max-w-lg border border-[#2b3844] bg-[#12181f]">
+            <div className="hazard h-1.5 w-full opacity-70" />
+            <div className="max-h-[80vh] overflow-y-auto px-7 py-6">
+              <div className="flex items-center justify-between">
+                <div className="font-display text-3xl tracking-wider">УПРАВЛЕНИЕ</div>
+                <button onClick={() => setHowtoOpen(false)} className="border border-[#3a4a5c] bg-[#182029] px-3 py-1.5 text-xs font-bold tracking-widest text-[#c8d2dd] hover:border-[#f2a33c]">✕</button>
+              </div>
+              <div className="mt-4 space-y-2 text-[13px] leading-relaxed text-[#aab6c4]">
+                {!isMobile ? (
+                  <>
+                    <p><span className="key">W</span><span className="key">A</span><span className="key">S</span><span className="key">D</span> — передвижение</p>
+                    <p><span className="key">МЫШЬ</span> — обзор (движение мыши, курсор в бою скрыт)</p>
+                    <p><span className="key">ЛКМ</span> — огонь · <span className="key">ПКМ</span> — оптика AWP ×4</p>
+                    <p><span className="key">R</span> — перезарядка · <span className="key">G</span> — граната</p>
+                    <p><span className="key">SHIFT</span> — тихий шаг (выше точность) · <span className="key">SPACE</span> — прыжок</p>
+                    <p><span className="key">TAB</span> — арсенал · <span className="key">1</span>–<span className="key">9</span> / колесо — смена оружия</p>
+                    <p><span className="key">ESC</span> — пауза</p>
+                  </>
+                ) : (
+                  <>
+                    <p><span className="key">◐</span> левая зона — джойстик движения</p>
+                    <p><span className="key">◑</span> правая зона — обзор (веди пальцем)</p>
+                    <p><span className="key">●</span> красная кнопка — огонь (удерживай)</p>
+                    <p><span className="key">⌖</span> — прыжок · <span className="key">R</span> — перезарядка · <span className="key">G</span> — граната</p>
+                    <p><span className="key">1–6</span> — слоты оружия сверху (тап для выбора)</p>
+                    <p><span className="key">ОПТ</span> — оптика AWP · <span className="key">▮▮</span> — пауза</p>
+                  </>
+                )}
+                <p className="border-t border-[#2b3844] pt-3 text-[12px] text-[#8b98a7]">
+                  Прыгайте на ящики, бочки и контейнеры, чтобы занять высоту. Хедшот — урон ×4. AWP убивает с тела.
+                </p>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ============ РЕКЛАМА ЗА НАГРАДУ (over) ============ */}
+      {screen === 'over' && isYandex() && !adBonus && (
+        <div className="pointer-events-none absolute inset-x-0 bottom-6 z-40 flex justify-center">
+          <button onClick={watchAdForBonus} className="btn-blade pointer-events-auto border border-[#7fd08a] bg-[#0f1b14]/95 px-6 py-2.5 text-sm text-[#7fd08a] hover:bg-[#16291c]">
+            <span className="inline-block skew-x-[8deg]">📺 РЕКЛАМА: +2 ГРАНАТЫ В СЛЕДУЮЩЕМ МАТЧЕ</span>
+          </button>
         </div>
       )}
     </div>

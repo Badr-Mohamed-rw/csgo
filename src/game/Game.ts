@@ -4,6 +4,8 @@ import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js'
 import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js'
 import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js'
 import { buildMap, collideMove, groundSupport, type MapData } from './map'
+import { BOT_NAMES, getLang, t } from './i18n'
+import { gameplayStart, gameplayStop } from './yandex'
 import { Bot, type BotHooks } from './bots'
 import { SFX } from './audio'
 
@@ -36,7 +38,8 @@ export interface GameHooks {
 
 type State = 'attract' | 'playing' | 'roundEnd' | 'dying' | 'paused'
 
-const NAMES = ['Феникс', 'Гюрза', 'Кобра', 'Шакал', 'Коршун', 'Таран', 'Волк', 'Гадюка', 'Беркут', 'Росомаха']
+/* имена ботов — из локали */
+const NAMES = () => BOT_NAMES[getLang()]
 const ROUND_TIME = 115
 const WINS_NEEDED = 3
 
@@ -212,8 +215,13 @@ export class Game {
   private reloading = false
   private reloadT = 0
   private reloadTotal = 1.9
+  private reloadAnim = 0 // 0..1 анимация перезарядки
   private cooldown = 0
   private firing = false
+
+  // бонус гранат за rewarded-рекламу
+  private grenadeBonus = 0
+  addGrenadeBonus(n: number) { this.grenadeBonus += n }
 
   // сенсорный ввод (мобильные)
   private joyX = 0
@@ -232,6 +240,10 @@ export class Game {
   private mouseInit = false
   private keys: Record<string, boolean> = {}
   private deathT = 0
+
+  // настройки (применяются извне)
+  private sens = 1
+  private qualitySetting: 'auto' | 'high' | 'low' = 'auto'
 
   // match
   private round = 0
@@ -368,11 +380,38 @@ export class Game {
     // постобработка: bloom + тонмаппинг
     this.composer = new EffectComposer(this.renderer)
     this.composer.addPass(new RenderPass(this.scene, this.camera))
-    // bloom — дорогая операция, на слабых GPU и телефонах отключаем
-    if (!PERF_LOW) {
-      this.bloomPass = new UnrealBloomPass(new THREE.Vector2(container.clientWidth, container.clientHeight), 0.5, 0.5, 0.82)
-      this.composer.addPass(this.bloomPass)
+    // bloom — дорогая операция, на слабых GPU и телефонах отключён по умолчанию
+    this.bloomPass = new UnrealBloomPass(new THREE.Vector2(container.clientWidth, container.clientHeight), 0.6, 0.4, 0.85)
+    this.bloomPass.enabled = !PERF_LOW
+    this.composer.addPass(this.bloomPass)
+    
+    // Vignette эффект
+    const vignetteShader = {
+      uniforms: {
+        tDiffuse: { value: null },
+        darkness: { value: 1.2 },
+        offset: { value: 1.0 }
+      },
+      vertexShader: `
+        varying vec2 vUv;
+        void main() {
+          vUv = uv;
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }
+      `,
+      fragmentShader: `
+        uniform sampler2D tDiffuse;
+        uniform float darkness;
+        uniform float offset;
+        varying vec2 vUv;
+        void main() {
+          vec4 texel = texture2D(tDiffuse, vUv);
+          vec2 uv = (vUv - vec2(0.5)) * vec2(offset);
+          gl_FragColor = vec4(mix(texel.rgb, vec3(0.0), dot(uv, uv) * darkness), texel.a);
+        }
+      `
     }
+    
     this.composer.addPass(new OutputPass())
 
     this.pos.set(this.map.playerSpawn.x, 0, this.map.playerSpawn.z)
@@ -489,16 +528,47 @@ export class Game {
     const muzzle = new THREE.Object3D()
     const css = (c: number) => `#${c.toString(16).padStart(6, '0')}`
 
-    // материалы с текстурами + bump-рельефом
+    // Улучшенные материалы с bump-рельефом
     const metalTex = this.texMetal(css(spec.bodyMat === 'metal' ? spec.bodyColor : 0x2b2e33))
     const woodTex = this.texWood()
     const polyTex = this.texPolymer(css(spec.bodyColor))
-    const matMetal = new THREE.MeshStandardMaterial({ map: metalTex, bumpMap: metalTex, bumpScale: 0.25, roughness: 0.46, metalness: 0.72 })
-    const matDark = new THREE.MeshStandardMaterial({ map: this.texMetal('#17191c'), bumpMap: this.texMetal('#17191c'), bumpScale: 0.2, roughness: 0.4, metalness: 0.8 })
-    const matWood = new THREE.MeshStandardMaterial({ map: woodTex, bumpMap: woodTex, bumpScale: 0.45, roughness: 0.66, metalness: 0.06 })
-    const matPoly = new THREE.MeshStandardMaterial({ map: polyTex, bumpMap: polyTex, bumpScale: 0.3, roughness: 0.85, metalness: 0.1 })
+    
+    const matMetal = new THREE.MeshStandardMaterial({ 
+      map: metalTex, 
+      bumpMap: metalTex, 
+      bumpScale: 0.3, 
+      roughness: 0.42, 
+      metalness: 0.78 
+    })
+    const matDark = new THREE.MeshStandardMaterial({ 
+      map: this.texMetal('#17191c'), 
+      bumpMap: this.texMetal('#17191c'), 
+      bumpScale: 0.25, 
+      roughness: 0.38, 
+      metalness: 0.85 
+    })
+    const matWood = new THREE.MeshStandardMaterial({ 
+      map: woodTex, 
+      bumpMap: woodTex, 
+      bumpScale: 0.5, 
+      roughness: 0.68, 
+      metalness: 0.05 
+    })
+    const matPoly = new THREE.MeshStandardMaterial({ 
+      map: polyTex, 
+      bumpMap: polyTex, 
+      bumpScale: 0.35, 
+      roughness: 0.82, 
+      metalness: 0.08 
+    })
     const gloveTex = this.texPolymer('#6e6848')
-    const matGlove = new THREE.MeshStandardMaterial({ map: gloveTex, bumpMap: gloveTex, bumpScale: 0.5, roughness: 0.92, metalness: 0.04 })
+    const matGlove = new THREE.MeshStandardMaterial({ 
+      map: gloveTex, 
+      bumpMap: gloveTex, 
+      bumpScale: 0.55, 
+      roughness: 0.9, 
+      metalness: 0.03 
+    })
     const matBody = spec.bodyMat === 'wood' ? matWood : spec.bodyMat === 'poly' ? matPoly : matMetal
     const matBlade = new THREE.MeshStandardMaterial({ color: 0xd9dee3, roughness: 0.22, metalness: 0.95 })
 
@@ -723,7 +793,7 @@ export class Game {
   private buildWeapons() {
     const root = this.weapon
     for (const id of WEAPON_ORDER) {
-      const { group, muzzle } = this.buildGunModel(WEAPONS[id].gun)
+      const { group, muzzle } = id === 'ak' ? this.buildAK47() : this.buildGunModel(WEAPONS[id].gun)
       this.weaponModels[id] = group
       this.weaponMuzzles[id] = muzzle
       root.add(group)
@@ -731,6 +801,101 @@ export class Game {
     }
     root.position.set(0.24, -0.22, -0.45)
     this.camera.add(root)
+  }
+
+  private buildAK47() {
+    const g = new THREE.Group()
+    const muzzle = new THREE.Object3D()
+    
+    // Текстуры
+    const metalTex = this.texMetal('#3a3d42')
+    const woodTex = this.texWood()
+    const matMetal = new THREE.MeshStandardMaterial({ map: metalTex, bumpMap: metalTex, bumpScale: 0.3, roughness: 0.45, metalness: 0.75 })
+    const matDark = new THREE.MeshStandardMaterial({ map: this.texMetal('#1a1c20'), roughness: 0.4, metalness: 0.8 })
+    const matWood = new THREE.MeshStandardMaterial({ map: woodTex, bumpMap: woodTex, bumpScale: 0.5, roughness: 0.7, metalness: 0.05 })
+    const matGlove = new THREE.MeshStandardMaterial({ color: 0x2a2d24, roughness: 0.9 })
+
+    const box = (w: number, h: number, d: number, m: THREE.Material, x: number, y: number, z: number, rx = 0, ry = 0, rz = 0) => {
+      const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), m)
+      mesh.position.set(x, y, z)
+      mesh.rotation.set(rx, ry, rz)
+      g.add(mesh)
+      return mesh
+    }
+    const cyl = (r1: number, r2: number, len: number, m: THREE.Material, x: number, y: number, z: number) => {
+      const mesh = new THREE.Mesh(new THREE.CylinderGeometry(r1, r2, len, 16), m)
+      mesh.rotation.x = Math.PI / 2
+      mesh.position.set(x, y, z)
+      g.add(mesh)
+      return mesh
+    }
+
+    // Ствольная коробка (receiver)
+    box(0.075, 0.095, 0.5, matMetal, 0, 0, -0.04)
+    
+    // Ствол с газоотводной трубкой
+    cyl(0.016, 0.016, 0.36, matDark, 0, 0.022, -0.46)
+    cyl(0.011, 0.011, 0.28, matMetal, 0, 0.045, -0.42) // газоотвод
+    
+    // Цевьё (handguard) - деревянное с вентиляционными отверстиями
+    box(0.068, 0.072, 0.24, matWood, 0, -0.004, -0.28)
+    for (let i = 0; i < 4; i++) {
+      box(0.062, 0.015, 0.008, matDark, 0, -0.004, -0.2 - i * 0.05)
+    }
+    
+    // Магазин (magazine) - изогнутый
+    const magGroup = new THREE.Group()
+    magGroup.position.set(0, -0.16, 0.03)
+    magGroup.rotation.x = 0.22
+    box(0.058, 0.2, 0.1, matMetal, 0, 0, 0)
+    // Рёбра жёсткости на магазине
+    for (let i = 0; i < 3; i++) {
+      box(0.06, 0.008, 0.102, matDark, 0, -0.06 + i * 0.06, 0)
+    }
+    g.add(magGroup)
+    
+    // Приклад (stock) - деревянный
+    box(0.06, 0.085, 0.24, matWood, 0, -0.012, 0.3)
+    box(0.055, 0.075, 0.02, matDark, 0, -0.012, 0.42) // затыльник
+    
+    // Рукоять (grip)
+    box(0.05, 0.11, 0.055, matWood, 0, -0.1, 0.12, -0.25)
+    
+    // Прицельные приспособления
+    box(0.012, 0.05, 0.012, matDark, 0, 0.078, -0.6) // мушка
+    box(0.05, 0.03, 0.02, matDark, 0, 0.062, 0.1) // целик
+    
+    // Дульный компенсатор
+    cyl(0.02, 0.02, 0.06, matMetal, 0, 0.022, -0.66)
+    box(0.035, 0.008, 0.05, matDark, 0, 0.022, -0.66) // прорези
+    
+    // Затворная рама (bolt carrier)
+    box(0.07, 0.04, 0.15, matMetal, 0, 0.04, 0.05)
+    box(0.014, 0.045, 0.014, matMetal, 0.04, 0.045, 0.1) // рукоятка взведения
+    
+    // Руки
+    const fist = (x: number, y: number, z: number, rx = 0) => {
+      const hand = new THREE.Group()
+      const palm = new THREE.Mesh(new THREE.BoxGeometry(0.082, 0.075, 0.085), matGlove)
+      hand.add(palm)
+      const fingers = new THREE.Mesh(new THREE.BoxGeometry(0.084, 0.045, 0.06), matGlove)
+      fingers.position.set(0, -0.012, -0.06)
+      fingers.rotation.x = -0.4
+      hand.add(fingers)
+      const forearm = new THREE.Mesh(new THREE.BoxGeometry(0.075, 0.062, 0.26), matGlove)
+      forearm.position.set(0.05, -0.02, 0.26)
+      forearm.rotation.set(0.18, -0.15, 0)
+      hand.add(forearm)
+      hand.position.set(x, y, z)
+      hand.rotation.x = rx
+      g.add(hand)
+    }
+    fist(0, -0.004, -0.28, 0.2) // левая на цевье
+    fist(0, -0.1, 0.12, -0.25) // правая на рукояти
+
+    muzzle.position.set(0, 0.022, -0.69)
+    g.add(muzzle)
+    return { group: g, muzzle }
   }
 
   private makeGlowTex(): THREE.CanvasTexture {
@@ -795,7 +960,7 @@ export class Game {
     if (this.state !== 'playing') return
     if (this.locked) {
       // захват мыши: движение 1:1
-      const s = 0.0032
+      const s = 0.0032 * this.sens
       this.yaw -= e.movementX * s
       this.pitch = Math.max(-1.45, Math.min(1.45, this.pitch - e.movementY * s))
     } else {
@@ -810,7 +975,7 @@ export class Game {
       const dy = e.movementY ?? e.clientY - this.lastCY
       this.lastCX = e.clientX
       this.lastCY = e.clientY
-      const s = 0.0045
+      const s = 0.0045 * this.sens
       this.yaw -= dx * s
       this.pitch = Math.max(-1.45, Math.min(1.45, this.pitch - dy * s))
     }
@@ -853,7 +1018,12 @@ export class Game {
     this.composer.setSize(w, h)
   }
   private onVisibility = () => {
-    if (document.hidden && this.state === 'playing') this.pause()
+    if (document.hidden) {
+      this.sfx.setMuted(true) // пункт 1.3: звук останавливается при потере фокуса
+      if (this.state === 'playing') this.pause()
+    } else {
+      this.sfx.setMuted(false)
+    }
   }
   private onContext = (e: Event) => e.preventDefault()
 
@@ -881,6 +1051,7 @@ export class Game {
 
   startMatch() {
     this.sfx.ensure()
+    gameplayStart()
     this.scoreA = 0
     this.scoreB = 0
     this.round = 0
@@ -896,6 +1067,8 @@ export class Game {
   resume() {
     if (this.state !== 'paused') return
     this.state = 'playing'
+    this.sfx.setMuted(false)
+    gameplayStart()
     this.requestLock()
   }
 
@@ -904,6 +1077,7 @@ export class Game {
     this.state = 'paused'
     this.firing = false
     this.mouseInit = false
+    gameplayStop()
     if (this.scoped) this.toggleScope(false)
     if (document.pointerLockElement) document.exitPointerLock()
     else this.hooks.lockedChange(false)
@@ -913,6 +1087,7 @@ export class Game {
     window.clearTimeout(this.roundTimeout)
     this.clearEntities()
     this.state = 'attract'
+    gameplayStop()
     if (this.scoped) this.toggleScope(false)
     if (document.pointerLockElement) document.exitPointerLock()
   }
@@ -946,6 +1121,33 @@ export class Game {
     if (i >= 0 && i < WEAPON_ORDER.length) this.switchTo(WEAPON_ORDER[i])
   }
   cycleWeaponPub(dir: number) { this.cycleWeapon(dir) }
+
+  /* ---------- настройки ---------- */
+  setSettings(s: { volume?: number; sens?: number; quality?: 'auto' | 'high' | 'low' }) {
+    if (s.volume !== undefined) this.sfx.setVolume(s.volume)
+    if (s.sens !== undefined) this.sens = Math.max(0.3, Math.min(2.5, s.sens))
+    if (s.quality !== undefined) {
+      this.qualitySetting = s.quality
+      this.applyQuality()
+    }
+  }
+
+  private applyQuality() {
+    const q = this.qualitySetting
+    let pr: number
+    let bloom: boolean
+    if (q === 'low') { pr = 1; bloom = false }
+    else if (q === 'high') { pr = Math.min(window.devicePixelRatio || 1, 1.75); bloom = true }
+    else { pr = Math.min(window.devicePixelRatio || 1, PERF_LOW ? 1 : 1.75); bloom = !PERF_LOW }
+    this.renderer.setPixelRatio(pr)
+    this.renderer.setSize(this.container.clientWidth, this.container.clientHeight)
+    this.composer.setSize(this.container.clientWidth, this.container.clientHeight)
+    if (this.bloomPass) this.bloomPass.enabled = bloom
+    this.degraded = q === 'low' // в ручном режиме автодеградацию не дёргаем
+  }
+
+  /** Пауза/фокус платформы: остановить звук (пункт 1.3 требований) */
+  setAudioPaused(m: boolean) { this.sfx.setMuted(m) }
 
   dispose() {
     cancelAnimationFrame(this.raf)
@@ -992,7 +1194,8 @@ export class Game {
     for (const id of WEAPON_ORDER) {
       this.ammo[id] = { mag: WEAPONS[id].mag, res: WEAPONS[id].res }
     }
-    this.nades = Math.min(3, this.round)
+    this.nades = Math.min(3, this.round) + this.grenadeBonus
+    this.grenadeBonus = 0
     this.reloading = false
     this.firing = false
     this.scoped = false
@@ -1013,7 +1216,8 @@ export class Game {
     }
     for (let i = 0; i < count; i++) {
       const s = spawns[i % spawns.length]
-      const bot = new Bot(NAMES[i % NAMES.length], s.x + (Math.random() - 0.5), s.z + (Math.random() - 0.5), (3 + this.round * 0.22 + Math.random() * 0.3) * 1.35, botHooks)
+      const names = NAMES()
+      const bot = new Bot(names[i % names.length], s.x + (Math.random() - 0.5), s.z + (Math.random() - 0.5), (3 + this.round * 0.22 + Math.random() * 0.3) * 1.35, botHooks)
       bot.group.rotation.y = Math.random() * Math.PI * 2
       this.scene.add(bot.group)
       bot.group.updateMatrixWorld(true)
@@ -1023,8 +1227,8 @@ export class Game {
     this.state = 'playing'
     const need = WINS_NEEDED - this.scoreA
     this.hooks.banner({
-      title: `РАУНД ${this.round}`,
-      sub: `противников: ${count} · стволы: [1][2][3] / колесо`,
+      title: `${t('round')} ${this.round}`,
+      sub: `${t('roundSub')}: ${count}`,
       tone: 'info',
     })
     this.sfx.beep(760, 0.12, 0.22)
@@ -1044,8 +1248,8 @@ export class Game {
     if (document.pointerLockElement) document.exitPointerLock()
     const done = this.scoreA >= WINS_NEEDED || this.scoreB >= WINS_NEEDED
     this.hooks.banner({
-      title: won ? 'РАУНД ВЫИГРАН' : 'РАУНД ПРОИГРАН',
-      sub: `счёт ${this.scoreA} : ${this.scoreB}`,
+      title: won ? t('roundWon') : t('roundLost'),
+      sub: `${t('score')} ${this.scoreA} : ${this.scoreB}`,
       tone: won ? 'win' : 'lose',
     })
     if (won) this.sfx.win()
@@ -1086,6 +1290,7 @@ export class Game {
     this.reloading = true
     this.reloadTotal = cfg.reload
     this.reloadT = cfg.reload
+    this.reloadAnim = 0 // начинаем анимацию
     this.sfx.reload()
   }
 
@@ -1226,7 +1431,7 @@ export class Game {
       this.state = 'dying'
       this.deathT = 0
       this.firing = false
-      this.hooks.banner({ title: 'ВЫ УБИТЫ', sub: 'раунд потерян', tone: 'lose' })
+      this.hooks.banner({ title: t('youKilled'), sub: t('roundLostSub'), tone: 'lose' })
       this.sfx.lose()
     }
   }
@@ -1334,7 +1539,7 @@ export class Game {
     const sc = 0.7 + Math.random() * 0.9
     d.m.scale.set(sc, sc, sc)
     d.m.visible = true
-    d.life = 7
+    d.life = 10 // следы от пуль исчезают через 10 секунд
   }
 
   /* ================= grenade ================= */
@@ -1596,7 +1801,7 @@ export class Game {
   private updatePlaying(dt: number) {
     // ---- обзор с сенсорной зоны (накопленные дельты) ----
     if (this.lookDX !== 0 || this.lookDY !== 0) {
-      const sens = 0.0042
+      const sens = 0.0042 * this.sens
       this.yaw -= this.lookDX * sens
       this.pitch = Math.max(-1.45, Math.min(1.45, this.pitch - this.lookDY * sens))
       this.lookDX = 0
@@ -1674,8 +1879,30 @@ export class Game {
     w.position.x += (targetX - w.position.x) * Math.min(1, 12 * dt)
     w.position.y = -0.22 + Math.abs(Math.cos(this.bobT)) * 0.008 * Math.min(1, hSpeed / 5) - dip
     w.position.z = -0.45 + this.kick * 0.055
+    
+    // Анимация перезарядки - реалистичная с опусканием оружия
     let rotX = this.kick * 0.1
-    if (this.reloading) rotX -= Math.sin(Math.min(1, 1 - this.reloadT / this.reloadTotal) * Math.PI) * 0.85
+    if (this.reloading) {
+      const reloadProgress = 1 - this.reloadT / this.reloadTotal
+      // Фаза 1 (0-0.3): наклон оружия вниз
+      // Фаза 2 (0.3-0.7): извлечение/вставка магазина
+      // Фаза 3 (0.7-1.0): возврат в позицию
+      if (reloadProgress < 0.3) {
+        const t = reloadProgress / 0.3
+        rotX -= Math.sin(t * Math.PI / 2) * 0.9
+        w.position.y -= Math.sin(t * Math.PI / 2) * 0.08
+      } else if (reloadProgress < 0.7) {
+        rotX -= 0.9
+        w.position.y -= 0.08
+        // Покачивание при вставке магазина
+        const t = (reloadProgress - 0.3) / 0.4
+        w.position.y += Math.sin(t * Math.PI * 2) * 0.01
+      } else {
+        const t = (reloadProgress - 0.7) / 0.3
+        rotX -= (1 - t) * 0.9
+        w.position.y -= (1 - t) * 0.08
+      }
+    }
     if (this.switchAnim < 1) rotX -= Math.sin(this.switchAnim * Math.PI) * 0.5
     w.rotation.x = rotX
     w.rotation.z = this.kick * 0.02
@@ -1690,8 +1917,10 @@ export class Game {
     this.switchAnim = Math.min(1, this.switchAnim + dt / 0.28)
     if (this.reloading) {
       this.reloadT -= dt
+      this.reloadAnim = 1 - this.reloadT / this.reloadTotal // прогресс анимации 0..1
       if (this.reloadT <= 0) {
         this.reloading = false
+        this.reloadAnim = 0
         const a = this.ammo[this.equipped]
         const take = Math.min(cfg.mag - a.mag, a.res)
         a.mag += take
